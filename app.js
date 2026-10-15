@@ -380,6 +380,7 @@ async function atualizarHistorico() {
 async function atualizarATR(silencioso = false) {
   if (buscando) return;
   buscando = true;
+  const jaBuscouAntes = !!st.ultimaBusca; // na primeira busca não avisa (só carrega)
   definirStatusBusca('Buscando o preço no site da AFCP…', true);
   let resultado = null, origem = '';
   for (const fonte of FONTES_ATR) {
@@ -400,16 +401,18 @@ async function atualizarATR(silencioso = false) {
   }
 
   const novidades = [];
+  const detalhes = [];
+  const descrever = (p, tipo) => `${rotuloMes(p.mes)} ${tipo}: R$ ${nf(p.kg, 4)}/kg (${brl(p.kg * CANA_PADRAO)}/t)`;
   const { mensal, estimativa } = resultado;
   if (mensal) {
     const atual = st.precos[mensal.mes];
-    if (!atual || atual.tipo !== 'final' || atual.kg !== mensal.kg) novidades.push(`${rotuloMes(mensal.mes)} fechado`);
+    if (!atual || atual.tipo !== 'final' || atual.kg !== mensal.kg) { novidades.push(`${rotuloMes(mensal.mes)} fechado`); detalhes.push(descrever(mensal, 'fechado')); }
     st.precos[mensal.mes] = { kg: mensal.kg, tipo: 'final', fonte: 'AFCP' };
   }
   if (estimativa) {
     const atual = st.precos[estimativa.mes];
     if (!atual || atual.tipo !== 'final') {
-      if (!atual || atual.kg !== estimativa.kg) novidades.push(`${rotuloMes(estimativa.mes)} estimado`);
+      if (!atual || atual.kg !== estimativa.kg) { novidades.push(`${rotuloMes(estimativa.mes)} estimado`); detalhes.push(descrever(estimativa, 'estimado')); }
       st.precos[estimativa.mes] = { kg: estimativa.kg, tipo: 'estimativa', fonte: `AFCP (${estimativa.numero}ª estimativa)` };
     }
   }
@@ -421,6 +424,9 @@ async function atualizarATR(silencioso = false) {
   if (!silencioso || novidades.length) {
     toast(novidades.length ? `Preço atualizado: ${novidades.join(' e ')}.` : 'Preço conferido, sem mudanças.');
   }
+  // conta ao service worker o que já foi lido, para ele não avisar de novo em segundo plano
+  enviarAoServiceWorker({ tipo: 'estado-atr', estado: { mensal, estimativa } });
+  if (novidades.length && jaBuscouAntes) notificarPreco(detalhes);
 }
 
 function textoUltimaBusca() {
@@ -626,8 +632,8 @@ function renderCalculadora() {
     </header>
     <div class="grade-2">
       <form id="f-calc" class="bloco form-grid" autocomplete="off">
-        <label>Toneladas<input name="toneladas" inputmode="decimal" value="30"></label>
-        <label>ATR da carga (kg/t)<input name="atr" inputmode="decimal" value="125"></label>
+        <label>Toneladas<input name="toneladas" inputmode="decimal" value="" placeholder="Ex.: 30"></label>
+        <label>ATR da carga (kg/t)<input name="atr" inputmode="decimal" value="" placeholder="Ex.: 125"></label>
         <div class="campo-fixo">
           <span>Preço do kg de ATR (R$)</span>
           <output name="kg" aria-readonly="true">${p ? nf(p.kg, 4) : '—'}</output>
@@ -833,6 +839,7 @@ function renderPrecos() {
         </div>
         <p class="sutil" data-status-busca style="margin-top:10px">${esc(textoUltimaBusca())}</p>
     </article>
+    ${blocoAppEAvisos()}
     <article class="bloco">
       <h2>Preços guardados</h2>
       ${chaves.length ? `<div class="rolagem"><table>
@@ -950,6 +957,10 @@ document.addEventListener('click', ev => {
 
   switch (b.dataset.acao) {
     case 'buscar-atr': atualizarATR(); break;
+    case 'ativar-avisos': ativarAvisos(); break;
+    case 'desativar-avisos': desativarAvisos(); break;
+    case 'testar-aviso': mostrarNotificacao('Preço do ATR (teste)', 'Assim vai chegar o aviso quando a AFCP publicar um preço novo.'); break;
+    case 'instalar-app': instalarApp(); break;
     case 'grafico-modo': modoGrafico = b.dataset.modo; renderGrafico(); break;
     case 'whatsapp': enviarWhatsApp(); break;
     case 'editar-entrega':
@@ -1028,8 +1039,134 @@ function rotularTabelas(raiz = document) {
 }
 new MutationObserver(() => rotularTabelas($('#conteudo'))).observe($('#conteudo'), { childList: true, subtree: true });
 
+/* ---------- Aplicativo (PWA) e avisos de preço ---------- */
+let swRegistro = null;
+let pedidoInstalacao = null; // evento guardado para mostrar o botão "Instalar"
+
+const suportaAvisos = () => 'Notification' in window;
+const ehIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+const instalado = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const avisosLigados = () => suportaAvisos() && Notification.permission === 'granted' && st.avisos !== false;
+
+function enviarAoServiceWorker(msg) {
+  const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+  if (sw) sw.postMessage(msg);
+}
+
+// espera o service worker ficar pronto (no máximo 4 s), porque o aviso pode sair logo ao abrir o app
+async function obterRegistro() {
+  if (swRegistro) return swRegistro;
+  if (!('serviceWorker' in navigator) || location.protocol === 'file:') return null;
+  return Promise.race([navigator.serviceWorker.ready, new Promise(r => setTimeout(() => r(null), 4000))]).catch(() => null);
+}
+
+async function mostrarNotificacao(titulo, corpo) {
+  const opcoes = { body: corpo, icon: 'icons/icon-192.png', badge: 'icons/icon-192.png', tag: 'preco-atr', renotify: true, data: { url: './#precos' } };
+  try {
+    const reg = await obterRegistro();
+    if (reg) return await reg.showNotification(titulo, opcoes); // Android exige este caminho
+    new Notification(titulo, opcoes);
+  } catch (e) { console.warn('Aviso não mostrado:', e); }
+}
+
+function notificarPreco(detalhes) {
+  if (!avisosLigados() || !detalhes.length) return;
+  mostrarNotificacao('Preço do ATR atualizado', detalhes.join('\n'));
+}
+
+async function ativarAvisos() {
+  if (!suportaAvisos()) {
+    toast(ehIOS() && !instalado() ? 'No iPhone, instale o app na tela de início para receber avisos.' : 'Este navegador não mostra avisos.');
+    return;
+  }
+  const r = await Notification.requestPermission();
+  if (r === 'granted') {
+    st.avisos = true; salvar();
+    await registrarConferenciaPeriodica();
+    mostrarNotificacao('Avisos ligados', 'Você vai ser avisado quando a AFCP publicar um preço novo do ATR.');
+  } else {
+    toast('Os avisos foram bloqueados. Libere nas configurações do navegador para este site.');
+  }
+  renderPrecos();
+}
+
+function desativarAvisos() {
+  st.avisos = false; salvar();
+  toast('Avisos desligados.');
+  renderPrecos();
+}
+
+// Chrome com o app instalado: deixa o navegador conferir o preço mesmo com o app fechado (cerca de 2 vezes por dia)
+async function registrarConferenciaPeriodica() {
+  try {
+    if (!swRegistro || !('periodicSync' in swRegistro)) return false;
+    const perm = await navigator.permissions.query({ name: 'periodic-background-sync' });
+    if (perm.state !== 'granted') return false;
+    await swRegistro.periodicSync.register('checar-atr', { minInterval: 12 * 60 * 60 * 1000 });
+    return true;
+  } catch (e) { return false; }
+}
+
+async function instalarApp() {
+  if (pedidoInstalacao) {
+    pedidoInstalacao.prompt();
+    const { outcome } = await pedidoInstalacao.userChoice;
+    pedidoInstalacao = null;
+    if (outcome === 'accepted') toast('Aplicativo instalado.');
+    renderPrecos();
+  } else if (ehIOS()) {
+    toast('No iPhone: toque em Compartilhar e depois em "Adicionar à Tela de Início".');
+  } else {
+    toast('Use o menu do navegador e escolha "Instalar aplicativo" ou "Adicionar à tela inicial".');
+  }
+}
+
+function blocoAppEAvisos() {
+  let estadoAviso, botaoAviso;
+  if (!suportaAvisos()) {
+    estadoAviso = ehIOS() && !instalado()
+      ? 'No iPhone os avisos só funcionam com o app instalado na tela de início (iOS 16.4 ou mais novo).'
+      : 'Este navegador não mostra avisos.';
+    botaoAviso = '';
+  } else if (Notification.permission === 'denied') {
+    estadoAviso = 'Avisos bloqueados neste navegador. Libere nas configurações do site (ícone do cadeado ao lado do endereço).';
+    botaoAviso = '';
+  } else if (avisosLigados()) {
+    estadoAviso = 'Avisos ligados. Quando a AFCP publicar uma estimativa nova ou o valor fechado do mês, aparece uma notificação.';
+    botaoAviso = '<button class="btn sec" data-acao="testar-aviso">Enviar aviso de teste</button><button class="link-btn perigo" data-acao="desativar-avisos">Desligar avisos</button>';
+  } else {
+    estadoAviso = 'Receba uma notificação quando a AFCP publicar um preço novo do ATR.';
+    botaoAviso = '<button class="btn" data-acao="ativar-avisos">Ativar avisos de preço</button>';
+  }
+  const botaoInstalar = instalado()
+    ? '<span class="selo final">App instalado</span>'
+    : `<button class="btn sec" data-acao="instalar-app">Instalar no celular</button>`;
+  return `
+    <article class="bloco">
+      <h2>Aplicativo e avisos</h2>
+      <p class="sutil">${estadoAviso}</p>
+      <div class="acoes" style="margin-top:14px">${botaoAviso}${botaoInstalar}</div>
+      <p class="sutil" style="margin-top:12px">Com o app aberto ou em segundo plano, o aviso chega na hora. Com ele fechado, só o Chrome com o app instalado confere sozinho, cerca de duas vezes por dia.</p>
+    </article>`;
+}
+
+function iniciarPWA() {
+  window.addEventListener('beforeinstallprompt', ev => { ev.preventDefault(); pedidoInstalacao = ev; renderPrecos(); });
+  window.addEventListener('appinstalled', () => { pedidoInstalacao = null; renderPrecos(); });
+  if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+  navigator.serviceWorker.register('sw.js').then(async reg => {
+    swRegistro = await navigator.serviceWorker.ready;
+    if (avisosLigados()) registrarConferenciaPeriodica();
+  }).catch(e => console.warn('Service worker não registrado:', e));
+  navigator.serviceWorker.addEventListener('message', ev => {
+    if (ev.data && ev.data.tipo === 'abrir') irPara(ev.data.view);
+  });
+}
+
 /* ---------- Início ---------- */
 renderTudo();
+iniciarPWA();
+if (location.hash === '#precos') irPara('precos');
 
 /* ---------- Atualização automática do preço ---------- */
 
