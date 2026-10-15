@@ -3,9 +3,9 @@
    - confere o preço do ATR na AFCP em segundo plano (quando o navegador permite)
    - mostra a notificação e abre o app ao tocar nela */
 
-const VERSAO = 'preco-de-cana-v1';
+const VERSAO = 'preco-de-cana-v2';
 const ARQUIVOS = [
-  './', './index.html', './style.css', './app.js', './manifest.webmanifest',
+  './', './index.html', './style.css', './app.js', './analytics.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
   './icons/apple-touch-icon.png', './icons/favicon-64.png'
 ];

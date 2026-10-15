@@ -90,6 +90,13 @@ let buscando = false;
 let ultimoHtmlAFCP = '';
 let avisoBusca = null; // mensagem da última tentativa que falhou
 
+/* ---------- Google Analytics ---------- */
+window.__eventosPendentes = window.__eventosPendentes || [];
+function evento(nome, params = {}) {
+  if (typeof window.registrarEvento === 'function') window.registrarEvento(nome, params);
+  else window.__eventosPendentes.push([nome, params]);
+}
+
 /* ---------- Utilidades ---------- */
 const $ = (s, el = document) => el.querySelector(s);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -427,6 +434,7 @@ async function atualizarATR(silencioso = false) {
   // conta ao service worker o que já foi lido, para ele não avisar de novo em segundo plano
   enviarAoServiceWorker({ tipo: 'estado-atr', estado: { mensal, estimativa } });
   if (novidades.length && jaBuscouAntes) notificarPreco(detalhes);
+  if (novidades.length) evento('preco_atr_novo', { quantidade: novidades.length });
 }
 
 function textoUltimaBusca() {
@@ -660,6 +668,8 @@ function atualizarCalculadora() {
     return;
   }
   const c = calcular(ton, atr, kg);
+  clearTimeout(atualizarCalculadora.t);
+  atualizarCalculadora.t = setTimeout(() => evento('calculo_simulado'), 5000);
   const padrao = CANA_PADRAO * kg;
   const dif = c.porTon - padrao;
   out.innerHTML = `
@@ -878,6 +888,7 @@ function irPara(view) {
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('ativa', v.id === 'v-' + view));
   document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('ativo', b.dataset.view === view));
   if (view === 'grafico') rolarGraficoParaFim();
+  evento('screen_view', { screen_name: view, firebase_screen: view });
   window.scrollTo({ top: 0 });
 }
 
@@ -921,6 +932,7 @@ function importarCSV(texto) {
   }
   salvar();
   renderTudo();
+  evento('importar_csv', { entregas: ok });
   toast(`${ok} entrega(s) importada(s)${erro ? `, ${erro} linha(s) com erro ignorada(s)` : ''}.`);
 }
 
@@ -956,13 +968,13 @@ document.addEventListener('click', ev => {
   const id = b.dataset.id;
 
   switch (b.dataset.acao) {
-    case 'buscar-atr': atualizarATR(); break;
+    case 'buscar-atr': atualizarATR(); evento('atualizar_preco_manual'); break;
     case 'ativar-avisos': ativarAvisos(); break;
     case 'desativar-avisos': desativarAvisos(); break;
     case 'testar-aviso': mostrarNotificacao('Preço do ATR (teste)', 'Assim vai chegar o aviso quando a AFCP publicar um preço novo.'); break;
-    case 'instalar-app': instalarApp(); break;
-    case 'grafico-modo': modoGrafico = b.dataset.modo; renderGrafico(); break;
-    case 'whatsapp': enviarWhatsApp(); break;
+    case 'instalar-app': instalarApp(); evento('clique_instalar'); break;
+    case 'grafico-modo': modoGrafico = b.dataset.modo; renderGrafico(); evento('grafico_modo', { modo: modoGrafico }); break;
+    case 'whatsapp': enviarWhatsApp(); evento('resumo_whatsapp'); break;
     case 'editar-entrega':
       editandoEntrega = id; renderEntregas();
       $('#f-entrega').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -973,10 +985,11 @@ document.addEventListener('click', ev => {
         st.entregas = st.entregas.filter(x => x.id !== id);
         if (editandoEntrega === id) editandoEntrega = null;
         salvar(); renderTudo(); toast('Entrega excluída.');
+        evento('entrega_excluida');
       }
       break;
     case 'importar-csv': $('#arq-csv').click(); break;
-    case 'exportar-csv': exportarCSV(); break;
+    case 'exportar-csv': exportarCSV(); evento('exportar_csv'); break;
   }
 });
 
@@ -1011,9 +1024,11 @@ document.addEventListener('submit', ev => {
       Object.assign(st.entregas.find(x => x.id === editandoEntrega), dados);
       editandoEntrega = null;
       toast('Entrega atualizada.');
+      evento('entrega_editada');
     } else {
       st.entregas.push({ id: uid(), ...dados });
       toast('Entrega lançada.');
+      evento('entrega_lancada', { safra: safraDe(dados.data) });
     }
     safraSel = safraDe(dados.data);
     salvar(); renderTudo(); irPara('entregas');
@@ -1080,6 +1095,7 @@ async function ativarAvisos() {
     return;
   }
   const r = await Notification.requestPermission();
+  evento('avisos_permissao', { resultado: r });
   if (r === 'granted') {
     st.avisos = true; salvar();
     await registrarConferenciaPeriodica();
@@ -1152,7 +1168,7 @@ function blocoAppEAvisos() {
 
 function iniciarPWA() {
   window.addEventListener('beforeinstallprompt', ev => { ev.preventDefault(); pedidoInstalacao = ev; renderPrecos(); });
-  window.addEventListener('appinstalled', () => { pedidoInstalacao = null; renderPrecos(); });
+  window.addEventListener('appinstalled', () => { pedidoInstalacao = null; renderPrecos(); evento('app_instalado'); });
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
   navigator.serviceWorker.register('sw.js').then(async reg => {
     swRegistro = await navigator.serviceWorker.ready;
@@ -1166,6 +1182,7 @@ function iniciarPWA() {
 /* ---------- Início ---------- */
 renderTudo();
 iniciarPWA();
+if (location.hash !== '#precos') evento('screen_view', { screen_name: 'painel' });
 if (location.hash === '#precos') irPara('precos');
 
 /* ---------- Atualização automática do preço ---------- */
